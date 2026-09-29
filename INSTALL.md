@@ -142,6 +142,23 @@ git remote add origin git@{GIT_HOST}:{group}/team-diary.git
 git add -A && git commit -m "Diary skeleton" && git push -u origin main
 ```
 
+### 3.6 Access for each member
+
+Every member needs write access to the diary repo over SSH.
+
+```bash
+[ -f ~/.ssh/id_ed25519.pub ] || ssh-keygen -q -t ed25519 -N "" -C "<email>" -f ~/.ssh/id_ed25519
+pbcopy < ~/.ssh/id_ed25519.pub      # Windows: clip < ~/.ssh/id_ed25519.pub; Linux: wl-copy or xclip
+ssh -T -o StrictHostKeyChecking=accept-new git@{GIT_HOST}   # expect a greeting with your username
+```
+
+The person pastes the public key in the hosting's SSH keys page. If port 22 is blocked, clone over HTTPS and use a personal
+access token with read and write repository scopes as the password. The token is typed in a terminal only, never in the chat.
+
+After cloning, set the identity inside the diary only (`git config user.name`, `git config user.email`). The email must match
+the "Roles" table: that's how the agent knows whose side it is. If the global git email belongs to another context
+(for example, a work address on a personal machine), don't touch it; set it per repo.
+
 ---
 
 ## 4. Step 2 — `CLAUDE.md`
@@ -392,7 +409,10 @@ Where to work: <repository>, branch <feat/KEY-…> from <base>, in a worktree if
 
 ### 7.5 Scheduled morning
 
-In the Claude app, create a scheduled task for weekdays at the right time, with the diary folder and the text `/start-work-day`.
+Create a scheduled task in the Claude desktop app: Code, Scheduled, new task, weekdays at a fixed time, working folder is
+the diary, prompt `/start-work-day`. If the session has a scheduled-tasks tool, the agent can create it itself; create it from
+a session opened in the diary folder so the working directory is right. The machine has to be awake at that time, otherwise
+the run is skipped and the person starts the day by hand.
 
 ---
 
@@ -423,6 +443,66 @@ Task for Claude:
   log and run `--sync-frontmatter`.
 - Mark an AI comment with the first line `DD.MM: AI comment (on behalf of <role>)`.
 - Keep a table in `CLAUDE.md` of which statuses dev moves on its own and which only product moves.
+
+### 8.4 Tokens and config files
+
+Tracker tokens differ by product. Each person issues their own:
+
+| Tracker | Token | Auth header |
+|---|---|---|
+| Jira Server / Data Center | Profile, Personal Access Tokens | `Authorization: Bearer <token>` |
+| Jira Cloud | id.atlassian.com, Security, API tokens | Basic auth with email and token |
+| YouTrack | Profile, Account Security, Tokens | `Authorization: Bearer <token>` |
+| Linear | Settings, API, Personal API keys | `Authorization: <key>` |
+| GitHub / GitLab Issues | fine-grained token / personal access token | `Bearer` |
+
+`~/.claude/.tracker.env` (mode 600, outside the repo):
+
+```
+TRACKER_URL=https://tracker.example.com
+TRACKER_TOKEN=...
+TRACKER_EMAIL=...        # only for Basic auth (Jira Cloud)
+TRACKER_PROJECT=ABC
+```
+
+`.mcp.json` in the diary root. Launch through a small `run.sh` so the path works on every machine:
+
+```json
+{
+  "mcpServers": {
+    "tracker": { "type": "stdio", "command": "sh", "args": ["tools/mcp/tracker/run.sh"] }
+  }
+}
+```
+
+`.claude/settings.json` (in git, shared by everyone): allowed read-only commands, the media hook and the MCP server.
+Write tools of the tracker are not in `allow`, so Claude asks every time.
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "Bash(git status *)", "Bash(git log *)", "Bash(git show *)", "Bash(git diff *)", "Bash(git fetch *)",
+      "Bash(bash tools/sync.sh *)", "Bash(bash tools/watch.sh *)", "Bash(bash tools/day.sh *)",
+      "Bash(python3 tools/board.py)", "Bash(python3 tools/tracker_pull.py *)", "Bash(python3 tools/chat.py *)",
+      "Bash(bash tools/setup.sh *)",
+      "mcp__tracker__search", "mcp__tracker__get_issue", "mcp__tracker__transitions", "mcp__tracker__whoami"
+    ]
+  },
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/media-in-prompt.sh\"" } ] }
+    ]
+  },
+  "enabledMcpjsonServers": ["tracker"]
+}
+```
+
+On first open Claude Code asks to trust the folder and to approve the project's MCP server; the person confirms both.
+Personal overrides go to `.claude/settings.local.json`, which is not committed.
+
+If the tracker or the git hosting is reachable only through a VPN, say so in `CLAUDE.md` and make the scripts report
+"no connection" instead of failing silently.
 
 ---
 
@@ -561,21 +641,71 @@ AI population is a draft until a human has looked at it.
 
 ## 10. Step 8 — team chat (optional)
 
-### 10.1 Setup
+### 10.1 Bot and group
 
-- Group: all team members plus each member's bot. Make the bots administrators, otherwise they don't see all messages.
-- Each person has their own bot and their own token in `~/.claude/.diary-chat.env` (mode 600). The group id is stored there too.
+Each member has their own bot: it is the voice of their agent in the chat. Steps for one member:
 
-### 10.2 `tools/chat.py wait | send | history N | check`
+1. In Telegram, open @BotFather and send `/newbot`. Display name: "<Role>'s Claude". Username: any free name ending
+   in `bot`. BotFather replies with a token (a long string with a colon). Tap it to copy.
+2. The agent runs `bash tools/setup.sh secret chat`. The script reads the token from the clipboard, calls `getMe`
+   to verify it, writes it to the env file and clears the clipboard.
+3. Create the group once (any member): add all people and all bots.
+4. Make every bot an administrator with default rights. By default a bot in a group sees only commands and replies
+   to its own messages (privacy mode). Admin rights lift that. The alternative is `/setprivacy` in BotFather, Disable,
+   then remove the bot from the group and add it again: the setting applies only on join.
+5. The agent runs `python3 tools/chat.py check`: bot alive, member of the group, sees all messages.
+6. The person writes anything in the group. The agent runs `chat.py poll` and `chat.py senders`, finds the person's
+   numeric id and saves it: `chat.py owner <id> @nick`. The agent now knows whose messages are its human's and
+   accepts private messages to the bot only from that id.
+7. The agent sends a test line to the other agent (`chat.py send "… is online" --to "Claude <role>"`) and checks
+   that it arrived through `chat/` on the other machine.
 
-- `wait` uses long polling. It receives people's messages, replies and forwards, and saves photos and files to `private/chat/files/<date>/`.
-  Voice messages, video notes and videos are transcribed with the `transcribe` skill. The full log goes to `private/chat/<date>.jsonl`.
-  It exits when there's something to say. One listener per machine (lock).
-- `send "…" [--to "Claude <role>"] [--reply-to ID]` sends to the group, **puts a copy in `chat/<date>.md`
-  and immediately runs `sync.sh`**. Telegram bots don't see other bots' messages, so the second agent reads
-  the message through git (`watch.sh` shows it as a `↳ FOR YOU …` line).
-- `history N` prints the last N messages from the local log.
-- `check` verifies that the bot is alive, is in the group and has admin rights.
+Finding the group id: after someone writes in the group, `chat.py poll` prints it, or call `getUpdates` and read
+`message.chat.id`. Group ids are negative. When a group turns into a supergroup (admins added, history made visible,
+the group grew), the id changes to one starting with `-100`, and the old id returns an error with `migrate_to_chat_id`.
+The script must follow that field and rewrite the env file.
+
+`~/.claude/.diary-chat.env` (mode 600, outside the repo):
+
+```
+CHAT_BOT_TOKEN=123456:ABC...
+CHAT_ID=-100...
+CHAT_AGENT_NAME=Claude <role>
+CHAT_OWNER_ID=...
+CHAT_OWNER_USERNAME=nick
+```
+
+### 10.2 `tools/chat.py`
+
+| Command | What it does |
+|---|---|
+| `wait` | long polling, exits when something new arrives; one listener per machine |
+| `poll` | fetch what has accumulated without waiting |
+| `send "…" [--to "Claude <role>"] [--reply-to ID] [--file PATH]` | send to the group, copy into `chat/<date>.md`, run `sync.sh` right away |
+| `history [N]` | last N messages from the local log |
+| `check` | bot alive, in the group, sees all messages, owner set |
+| `senders` | who has written (name and numeric id), to find your human |
+| `owner ID @nick` | remember your human |
+
+What `wait` and `poll` handle:
+
+- Text, replies, forwards (with the original author), edits, photos and files. Files go to `private/chat/files/<date>/`,
+  the full log to `private/chat/<date>.jsonl`, the update offset to `private/chat/offset`.
+- Voice messages, video notes, audio and video are transcribed with the `transcribe` skill.
+- `my_chat_member` updates: the bot was added, removed or its rights changed. Tell the human.
+
+Telegram limits to handle in code:
+
+- Bots don't see messages from other bots. That's why every `send` writes a copy to `chat/` and pushes it; the other
+  agent reads it through git and `watch.sh` shows it as `↳ FOR YOU …`.
+- Only one `getUpdates` consumer per token. A second one gets `409 Conflict`. If a webhook is set, `getUpdates`
+  doesn't work at all; call `deleteWebhook` once.
+- Request only the updates you use: `allowed_updates = ["message", "edited_message", "my_chat_member"]`.
+- The Bot API downloads files up to 20 MB. For larger ones, say so in the chat and ask for a path or a link instead.
+- A message is at most 4096 characters. Split longer text.
+- On `429 Too Many Requests` wait for `retry_after` seconds and retry.
+- Timestamps in `chat/` use one fixed team time zone, written in `CLAUDE.md`. People and machines may be in different zones.
+- The bot answers private messages only from its own human and ignores everyone else.
 
 ### 10.3 Chat rules (in `CLAUDE.md`)
 
@@ -599,11 +729,16 @@ AI population is a draft until a human has looked at it.
 
 - The `.claude/skills/transcribe/` skill uses `faster-whisper`, model `large-v3-turbo`, `--lang auto`,
   with terms from `GLOSSARY.md` as the initial prompt. The full text goes to `private/transcripts/`; the diary gets a summary per the role scenario.
+- Install into a separate virtualenv outside the repo (for example `~/.local/share/diary-whisper/venv`), plus `ffmpeg`
+  (`brew install ffmpeg`, `apt install ffmpeg`, `winget install ffmpeg`). It's about 200 MB of packages and about 1.6 GB for
+  the model, downloaded on first run. Ask the person before installing, run it in the background, report when done.
 - Hook `.claude/hooks/media-in-prompt.sh` on `UserPromptSubmit`: when a message contains a path to `.ogg .oga .opus .mp3 .m4a .wav
   .mp4 .mov .webm`, it hints "use transcribe". If no engine is installed, it offers to install one and downloads nothing without consent.
+- Telegram voice messages arrive as `.oga` (Opus). `ffmpeg` handles them; no conversion step is needed.
 - Don't send recordings to external services.
 
-On a modern laptop, an hour-long call takes about 10–15 minutes to transcribe in the background.
+On a modern laptop, an hour-long call takes about 10–15 minutes to transcribe in the background. Test on real recordings
+with noise and several voices before relying on it; clean synthetic tests look better than reality.
 
 ---
 
@@ -611,16 +746,45 @@ On a modern laptop, an hour-long call takes about 10–15 minutes to transcribe 
 
 ### 12.1 `tools/setup.sh`
 
-- `setup.sh secret tracker | git | chat` opens the token issuance page, waits for the human to copy the token,
-  reads it from the clipboard into `~/.claude/.<what>.env` (mode 600), verifies login and clears the clipboard.
-  If the clipboard doesn't hold a token, it refuses and creates no file. The agent never sees the token.
-- `setup.sh status` shows what's ready and what's missing.
+| Command | What it does |
+|---|---|
+| `status` | what's ready: git identity, SSH access, tracker token, chat token, owner, transcription, scheduled task |
+| `open <page>` | opens the page where a token is issued: tracker tokens, git hosting tokens, SSH keys, BotFather |
+| `secret tracker \| git \| chat` | reads a token from the clipboard into `~/.claude/.<what>.env`, verifies login, clears the clipboard |
+
+Details of `secret`:
+
+- Clipboard: `pbpaste` on macOS, `Get-Clipboard` on Windows, `wl-paste` or `xclip -o` on Linux. Clearing works the same way.
+- Check the format with a regex per token type before writing (a Telegram token is `digits:35 chars`, a GitHub token starts with
+  `ghp_` or `github_pat_`, and so on). If it doesn't match, refuse and create no file. People often copy the wrong line.
+- Write with `umask 077`, then `chmod 600`.
+- Verify with a real call (`getMe`, `whoami`) and print only the account name.
+- The agent never asks the person to paste a token into the chat and never puts it in a command line.
 
 ### 12.2 `ONBOARDING.md`
 
-Write it step by step so the new member's agent can walk them through it: git and `user.email` (must match the "Roles" table);
-SSH key and repository access; a clone next to the work repositories; `setup.sh`; a trial `/start-work-day`;
-a trial entry in your own `inbox/` and `sync.sh`; a check that the other member saw it; a scheduled morning task.
+Write it for the new member's agent. The agent reads it and walks the person through one step at a time, waiting for a reply after
+each. Mark each step as "Claude:" (the agent runs it) or "You:" (only the person can do it). Put a short list at the top of what
+the person will have to do by hand, so they know what to expect.
+
+Steps:
+
+1. Tools: `git --version`, `python3 --version`. On macOS `xcode-select --install` provides both.
+2. Hosting account and access to the diary repo (the owner invites them).
+3. SSH key and check (§3.6), HTTPS with a token as a fallback.
+4. Clone next to the work repositories; `git config user.name` and `user.email` inside the diary (§3.6).
+5. Open the folder in Claude Code, trust it, approve the MCP server; `setup.sh status`.
+6. Tracker token: `setup.sh open tracker-token`, the person creates and copies it, `setup.sh secret tracker`.
+7. Bot and group (§10.1), all seven steps.
+8. Transcription, with consent (§11).
+9. Scheduled morning task (§7.5).
+10. First day: `setup.sh status` all green, `/start-work-day`, a trial inbox entry, `sync.sh`, and a check that the other
+    member's agent saw it.
+
+End with a one-screen reminder for every day: start with `/start-work-day`, send everything incoming to the chat or the agent,
+tokens and personal data never go in the chat, who to contact when something breaks.
+
+If a step fails, the agent writes down where it stopped, so the next session can resume from that step.
 
 ---
 
@@ -662,6 +826,12 @@ Record the result in `AUTOMATION.md`. Treat "builds", "works" and "verified" as 
 - [ ] `setup.sh`: non-token in the clipboard → refusal; token → file with mode 600, login verified, clipboard cleared.
 - [ ] `/start-work-day` in a new clone with an unknown email leads to `ONBOARDING.md`.
 - [ ] The transcription hook fires on an audio path and stays silent on plain text.
+- [ ] `chat.py check` reports that the bot sees all group messages; after removing admin rights it reports that it doesn't.
+- [ ] A second `chat.py wait` on the same token handles `409 Conflict` without crashing and the first one exits.
+- [ ] After the group becomes a supergroup, the script picks up the new id from `migrate_to_chat_id`.
+- [ ] A private message to the bot from someone other than its human is ignored.
+- [ ] A file over 20 MB in the chat produces a clear message instead of an error.
+- [ ] A new member goes through `ONBOARDING.md` on a clean machine without help from the author.
 
 ---
 
